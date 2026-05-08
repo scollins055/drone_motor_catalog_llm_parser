@@ -1,0 +1,6 @@
+pyproject.toml
+drone_motor_catalog_llm_parser.egg-info/PKG-INFO
+drone_motor_catalog_llm_parser.egg-info/SOURCES.txt
+drone_motor_catalog_llm_parser.egg-info/dependency_links.txt
+drone_motor_catalog_llm_parser.egg-info/requires.txt
+drone_motor_catalog_llm_parser.egg-info/top_level.txt
