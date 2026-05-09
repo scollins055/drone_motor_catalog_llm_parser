@@ -139,31 +139,82 @@ def run(image_path: Path) -> pd.DataFrame:
     rows = group_into_rows(detections, y_tol=10)
     print(f"  Detected {len(results)} text regions → {len(rows)} rows")
 
-    # Walk rows top-to-bottom, tracking motor type and current prop section
-    current_motor_type: Optional[str] = None
+    # PASS 1: scan all detections to find motor type, prop-label y-positions,
+    # and average row height (used to offset the section boundary).
+    motor_type: Optional[str] = None
+    label_y: dict[str, float] = {}
+    af_part: Optional[str] = None
+    kv_part: Optional[str] = None
+
+    throttle_ys: list[float] = []
+
+    for d in detections:
+        text = d["text"]
+        cx, cy = d["cx"], d["cy"]
+
+        # Motor type sits in the leftmost column (cx < 150).
+        # OCR often reads "0" as "O" — normalise before matching.
+        if cx < 150:
+            fixed = re.sub(r"[Oo]", "0", text)
+            if re.match(r"AF\s*\d+", fixed, re.IGNORECASE):
+                af_part = re.sub(r"\s+", "", fixed).upper()
+            elif re.match(r"KV\s*\d+", fixed, re.IGNORECASE):
+                kv_part = re.sub(r"\s+", "", fixed).upper()
+
+        # Prop section labels
+        if re.search(r"GF\s*7035", text, re.IGNORECASE):
+            label_y["GF7035 3-blades"] = cy
+        if re.search(r"GF\s*8040", text, re.IGNORECASE):
+            label_y["GF8040 3-blades"] = cy
+
+        # Collect throttle row y-positions to estimate row height
+        if re.match(r"^\d+%$", text):
+            throttle_ys.append(cy)
+
+    if af_part and kv_part:
+        motor_type = f"{af_part} {kv_part}"
+    elif af_part or kv_part:
+        motor_type = af_part or kv_part
+
+    # Estimate row height from median spacing of throttle detections
+    row_height = 40.0
+    if len(throttle_ys) >= 2:
+        row_height = float(np.median(np.diff(sorted(throttle_ys))))
+
+    # Section boundary: midpoint between the two prop labels, shifted forward by
+    # half a row so the last row of the first section isn't misclassified.
+    y_boundary: Optional[float] = None
+    if "GF7035 3-blades" in label_y and "GF8040 3-blades" in label_y:
+        y_boundary = (label_y["GF7035 3-blades"] + label_y["GF8040 3-blades"]) / 2 + row_height * 0.6
+        print(f"  Motor type: {motor_type}")
+        print(f"  Row height: {row_height:.1f}px  "
+              f"Section boundary: y={y_boundary:.0f}px  "
+              f"(GF7035@{label_y['GF7035 3-blades']:.0f}, "
+              f"GF8040@{label_y['GF8040 3-blades']:.0f})")
+
+    # PASS 2: parse data rows, assigning props by y-position vs boundary
     current_props: Optional[str] = None
     data = []
 
     for row in rows:
         texts = [d["text"] for d in row]
-        combined = " ".join(texts)
+        cy = row[0]["cy"]
 
-        # Detect motor type (e.g. "AF310 KV1210")
-        m = re.search(r"AF\s*\d+\s*KV\s*\d+", combined, re.IGNORECASE)
-        if m:
-            current_motor_type = re.sub(r"\s+", " ", m.group()).strip()
+        if y_boundary is not None:
+            props = "GF7035 3-blades" if cy < y_boundary else "GF8040 3-blades"
+        else:
+            # Fallback: sequential label tracking (original behaviour)
+            combined = " ".join(texts)
+            if re.search(r"GF\s*7035", combined, re.IGNORECASE):
+                current_props = "GF7035 3-blades"
+            elif re.search(r"GF\s*8040", combined, re.IGNORECASE):
+                current_props = "GF8040 3-blades"
+            props = current_props
 
-        # Detect prop section headers
-        if re.search(r"GF\s*7035", combined, re.IGNORECASE):
-            current_props = "GF7035 3-blades"
-        elif re.search(r"GF\s*8040", combined, re.IGNORECASE):
-            current_props = "GF8040 3-blades"
-
-        # Try to parse as a data row
         row_data = try_parse_data_row(texts)
-        if row_data and current_props:
-            row_data["motor_type"] = current_motor_type or "Unknown"
-            row_data["props"] = current_props
+        if row_data and props:
+            row_data["motor_type"] = motor_type or "Unknown"
+            row_data["props"] = props
             data.append(row_data)
 
     if not data:
@@ -172,10 +223,12 @@ def run(image_path: Path) -> pd.DataFrame:
             "motor performance table and that OCR can read the text."
         )
 
-    # Reorder columns to match the expected schema
+    # Reorder columns and sort by prop section then throttle ascending
     cols = ["motor_type", "props", "throttle_pct", "voltage_v", "current_a",
             "thrust_g", "rpm", "power_w", "efficiency_g_per_w"]
-    return pd.DataFrame(data)[cols]
+    df = pd.DataFrame(data)[cols]
+    df = df.sort_values(["props", "throttle_pct"]).reset_index(drop=True)
+    return df
 
 
 def main():
